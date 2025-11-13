@@ -1,156 +1,261 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SKZB体育直播API - Vercel修复版
+skzb.cc API - Render.com 优化版本
+体育直播导航API服务
 """
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
+from bs4 import BeautifulSoup
+import json
 import re
 from datetime import datetime
-from bs4 import BeautifulSoup
+import logging
+import os
+from urllib.parse import urljoin
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # 允许跨域请求
 
-matches_cache = {
-    'update_time': '',
-    'total': 0,
-    'matches': [],
-    'last_fetch': 0
-}
-
-CACHE_DURATION = 300
-
-def fetch_zqbaba_data():
-    url = "https://zqbaba.org"
-    try:
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        resp.encoding = 'gb2312'
-        html = resp.text
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        date_match = re.search(r'(\d{4})-\s*(?:<[^>]+>)?(\d{1,2})(?:</[^>]+>)?\s*-(\d{1,2})\s*星期', html)
-        if not date_match:
+class ZQBabaSpider:
+    """足球吧吧数据爬虫"""
+    
+    def __init__(self):
+        self.base_url = 'http://zqbaba.org'
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+    
+    def fetch_matches(self):
+        """获取比赛数据"""
+        try:
+            logger.info('开始获取比赛数据...')
+            
+            response = requests.get(self.base_url, headers=self.headers, timeout=15)
+            response.encoding = 'gb2312'
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            table = soup.find('table', {'id': 'table157'})
+            
+            if not table:
+                logger.error('未找到比赛数据表格')
+                return []
+            
+            matches = self._parse_matches(table)
+            logger.info(f'成功获取 {len(matches)} 场比赛数据')
+            
+            return matches
+            
+        except Exception as e:
+            logger.error(f'获取比赛数据失败: {str(e)}')
             return []
-        
-        current_date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+    
+    def _parse_matches(self, table):
+        """解析比赛数据"""
         matches = []
-        clean_html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
-        clean_html = re.sub(r'<style[^>]*>.*?</style>', '', clean_html, flags=re.DOTALL)
-        pattern = r'(\d{1,2}:\d{2})\s+([^<\n]{10,100}?VS[^<\n]{5,50})'
+        rows = table.find_all('tr')
+        current_match = None
         
-        match_positions = []
-        for match in re.finditer(pattern, clean_html):
-            time_str = match.group(1)
-            content = match.group(2).strip()
-            content = re.sub(r'&[a-z]+;', '', content)
-            content = ' '.join(content.split())
+        for row in rows:
+            td = row.find('td')
+            if not td:
+                continue
             
-            league = ''
-            league_patterns = [
-                r'英超第\d+轮', r'西甲第\d+轮', r'德甲第\d+轮', r'意甲第\d+轮', r'法甲第\d+轮',
-                r'NBA常规赛', r'CBA联赛', r'欧冠', r'欧联',
-                r'ATP[^\s]*', r'斯诺克[^\s]*', r'全运会[^\s]*', r'羽毛球[^\s]*', r'NFL[^\s]*'
-            ]
+            text = td.get_text().strip()
             
-            for lp in league_patterns:
-                lm = re.search(lp, content)
-                if lm:
-                    league = lm.group(0)
-                    break
-            
-            vs_match = re.search(r'([^\s]{2,25})\s+VS\s+([^\s]{2,25})', content)
-            teams = f"{vs_match.group(1)} VS {vs_match.group(2)}" if vs_match else ''
-            title = f"{league} {teams}".strip() if league else teams
-            
-            match_positions.append({
-                'match_data': {
-                    'id': f"{current_date}_{time_str}_{len(matches)}",
-                    'date': current_date,
-                    'time': time_str,
-                    'datetime': f"{current_date} {time_str}",
-                    'league': league,
-                    'teams': teams,
-                    'title': title,
-                    'links': [],
-                    'link_count': 0
-                }
-            })
-        
-        all_links = soup.find_all('a', href=True)
-        live_links = []
-        
-        for link in all_links:
-            href = link.get('href', '')
-            text = link.get_text().strip()
-            if any(keyword in href.lower() for keyword in ['live', 'play', 'stream', 'video']) or \
-               any(platform in href.lower() for platform in ['cctv', 'migu', 'tencent', 'qq', 'youku', 'iqiyi']):
-                if not any(exclude in href.lower() for exclude in ['javascript', 'void', '#', 'mailto']):
-                    live_links.append({'url': href, 'text': text})
-        
-        links_per_match = max(len(live_links) // max(len(match_positions), 1), 1)
-        
-        for i, match_info in enumerate(match_positions):
-            match_data = match_info['match_data']
-            start_idx = i * links_per_match
-            end_idx = min(start_idx + 3, len(live_links))
-            assigned_links = live_links[start_idx:end_idx] if start_idx < len(live_links) else []
-            
-            for link_idx, link in enumerate(assigned_links):
-                if 'cctv' in link['url'].lower():
-                    link_name = 'CCTV'
-                elif 'migu' in link['url'].lower():
-                    link_name = '咪咕'
-                elif any(x in link['url'].lower() for x in ['tencent', 'qq']):
-                    link_name = '腾讯'
-                elif 'youku' in link['url'].lower():
-                    link_name = '优酷'
-                elif 'iqiyi' in link['url'].lower():
-                    link_name = '爱奇艺'
-                else:
-                    link_name = f"直播信号{link_idx + 1}"
+            # 检查是否为比赛标题（包含时间和VS）
+            if re.search(r'\d{2}:\d{2}.*VS', text, re.IGNORECASE):
+                # 保存上一场比赛
+                if current_match:
+                    matches.append(current_match)
                 
-                match_data['links'].append({'name': link_name, 'url': link['url']})
+                current_match = self._parse_match_info(text)
             
-            match_data['link_count'] = len(match_data['links'])
-            matches.append(match_data)
+            # 检查是否为直播链接行
+            elif '直播' in text and current_match:
+                # 由于链接是动态生成的，这里添加占位符
+                # 实际项目中需要使用Selenium获取真实链接
+                current_match['links'].append({
+                    'name': text,
+                    'url': '#',  # 占位符，需要动态获取
+                    'type': 'placeholder',
+                    'description': '需要点击获取真实链接'
+                })
+        
+        # 添加最后一场比赛
+        if current_match:
+            matches.append(current_match)
         
         return matches
-    except Exception as e:
-        print(f"爬取失败: {e}")
-        return []
-
-def get_cached_data():
-    global matches_cache
-    current_time = datetime.now().timestamp()
-    if current_time - matches_cache.get('last_fetch', 0) > CACHE_DURATION:
-        matches = fetch_zqbaba_data()
-        matches_cache = {
-            'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'total': len(matches),
-            'matches': matches,
-            'last_fetch': current_time
+    
+    def _parse_match_info(self, text):
+        """解析单场比赛信息"""
+        # 解析时间
+        time_match = re.search(r'^(\d{2}:\d{2})', text)
+        time_str = time_match.group(1) if time_match else '未知'
+        
+        # 解析VS对阵
+        vs_match = re.search(r'(.+?)\s*VS\s*(.+)', text, re.IGNORECASE)
+        if not vs_match:
+            return None
+        
+        full_before = vs_match.group(1).strip()
+        team2 = vs_match.group(2).strip()
+        
+        # 提取联赛和队伍1
+        league, team1 = self._extract_league_and_team(full_before)
+        
+        return {
+            'time': time_str,
+            'league': league,
+            'team1': team1,
+            'team2': team2,
+            'teams': f'{team1} VS {team2}',
+            'links': [],
+            'status': 'upcoming',
+            'timestamp': datetime.now().isoformat()
         }
-    return matches_cache
+    
+    def _extract_league_and_team(self, full_text):
+        """提取联赛和队伍信息"""
+        league_patterns = [
+            (r'.*?(世预赛[^\s]*)', '世预赛'),
+            (r'.*?(NBA[^\s]*)', 'NBA'),
+            (r'.*?(ATP[^\s]*)', 'ATP'),
+            (r'.*?(NFL[^\s]*)', 'NFL'),
+            (r'.*?(足球友谊赛)', '友谊赛'),
+            (r'.*?(全运会[^\s]*)', '全运会'),
+            (r'.*?(英超)', '英超'),
+            (r'.*?(西甲)', '西甲'),
+            (r'.*?(意甲)', '意甲'),
+            (r'.*?(德甲)', '德甲'),
+            (r'.*?(法甲)', '法甲')
+        ]
+        
+        league = ''
+        team1 = full_text
+        
+        for pattern, league_name in league_patterns:
+            if re.search(pattern, full_text):
+                league = league_name
+                # 提取队伍1（移除时间和联赛信息）
+                temp = re.sub(r'^\d{2}:\d{2}\s*', '', full_text)  # 移除时间
+                temp = re.sub(pattern.replace('.*?', ''), '', temp).strip()  # 移除联赛
+                if temp:
+                    team1 = temp
+                break
+        
+        # 如果没有识别到联赛，直接提取队伍1
+        if not league:
+            team1_match = re.search(r'\d{2}:\d{2}\s*(.+)', full_text)
+            if team1_match:
+                team1 = team1_match.group(1).strip()
+        
+        return league, team1
+
+# 创建爬虫实例
+spider = ZQBabaSpider()
+
+@app.route('/', methods=['GET'])
+def home():
+    """API首页"""
+    return jsonify({
+        'success': True,
+        'message': 'skzb.cc 体育直播导航API',
+        'version': '1.0.0',
+        'endpoints': {
+            '/api/matches': 'GET - 获取比赛数据',
+            '/api/health': 'GET - 健康检查'
+        },
+        'timestamp': datetime.now().isoformat(),
+        'status': 'running'
+    })
 
 @app.route('/api/matches', methods=['GET'])
 def get_matches():
+    """获取比赛数据API"""
     try:
-        data = get_cached_data()
-        return jsonify({'success': True, **data})
+        matches = spider.fetch_matches()
+        
+        response = {
+            'success': True,
+            'message': '数据获取成功',
+            'timestamp': datetime.now().isoformat(),
+            'total_matches': len(matches),
+            'matches': matches,
+            'source': 'zqbaba.org',
+            'update_interval': '5分钟'
+        }
+        
+        return jsonify(response)
+        
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e), 'matches': [], 'total': 0}), 500
+        logger.error(f'API错误: {str(e)}')
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'ok', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
-
-@app.route('/', methods=['GET'])
-def index():
+    """健康检查"""
     return jsonify({
-        'service': 'SKZB体育直播API',
-        'version': '2.0',
-        'endpoints': ['GET /api/matches', 'GET /api/health']
+        'success': True,
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'uptime': 'running'
     })
+
+@app.route('/api/test', methods=['GET'])
+def test_connection():
+    """测试数据源连接"""
+    try:
+        response = requests.get('http://zqbaba.org', timeout=10)
+        return jsonify({
+            'success': True,
+            'source_status': response.status_code,
+            'source_available': response.status_code == 200,
+            'response_size': len(response.content),
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+# 错误处理
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'success': False,
+        'error': 'API端点未找到',
+        'available_endpoints': ['/api/matches', '/api/health', '/api/test'],
+        'timestamp': datetime.now().isoformat()
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'success': False,
+        'error': '服务器内部错误',
+        'timestamp': datetime.now().isoformat()
+    }), 500
+
+if __name__ == '__main__':
+    # Render.com 会自动设置PORT环境变量
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
